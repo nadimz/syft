@@ -3,6 +3,8 @@ package kernel
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -23,6 +25,21 @@ import (
 
 const linuxKernelMagicName = "Linux kernel"
 
+var arm32SafeSVCModeMaskAll = [...]uint32{
+	0xe10f9000,
+	0xe229901a,
+	0xe319001f,
+	0xe3c9901f,
+	0xe38990d3,
+	0x1a000004,
+	0xe3899c01,
+	0xe28fe00c,
+	0xe16ff009,
+	0xe12ef30e,
+	0xe160006e,
+	0xe121f009,
+}
+
 // This is a defensive candidate limit, not a limit imposed by the kernel format.
 const maxLinuxKernelBannerSize = 4096
 
@@ -35,11 +52,17 @@ func parseLinuxKernelFile(ctx context.Context, _ file.Resolver, _ *generic.Envir
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to get union reader for file: %w", err)
 	}
-	metadata, arm64Image, err := parseARM64LinuxKernel(ctx, unionReader)
+	metadata, recognized, err := parseARM64LinuxKernel(ctx, unionReader)
 	if err != nil {
 		return nil, nil, fmt.Errorf("unable to parse ARM64 kernel image: %w", err)
 	}
-	if !arm64Image {
+	if !recognized {
+		metadata, recognized, err = parseARM32LinuxKernel(ctx, unionReader)
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to parse ARM32 kernel image: %w", err)
+		}
+	}
+	if !recognized {
 		magicType, err := magic.GetType(unionReader)
 		if err != nil {
 			return nil, nil, fmt.Errorf("unable to get magic type for file: %w", err)
@@ -59,6 +82,52 @@ func parseLinuxKernelFile(ctx context.Context, _ file.Resolver, _ *generic.Envir
 			reader.Location,
 		),
 	}, nil, nil
+}
+
+func parseARM32LinuxKernel(ctx context.Context, reader io.ReaderAt) (pkg.LinuxKernel, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return pkg.LinuxKernel{}, false, err
+	}
+	var prefix [64]byte
+	count, err := reader.ReadAt(prefix[:], 0)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return pkg.LinuxKernel{}, false, err
+	}
+	if count < 60 {
+		return pkg.LinuxKernel{}, false, nil
+	}
+
+	start := 0
+	if binary.LittleEndian.Uint32(prefix[:4]) != arm32SafeSVCModeMaskAll[0] {
+		if count < len(prefix) || binary.LittleEndian.Uint32(prefix[:4])&0xff000000 != 0xeb000000 {
+			return pkg.LinuxKernel{}, false, nil
+		}
+		start = 4
+	}
+	if count < start+60 {
+		return pkg.LinuxKernel{}, false, nil
+	}
+	for index, expected := range arm32SafeSVCModeMaskAll {
+		actual := binary.LittleEndian.Uint32(prefix[start+index*4 : start+(index+1)*4])
+		if actual != expected {
+			return pkg.LinuxKernel{}, false, nil
+		}
+	}
+	if binary.LittleEndian.Uint32(prefix[start+48:start+52]) != 0xee109f10 ||
+		binary.LittleEndian.Uint32(prefix[start+56:start+60]) != 0xe1b0a005 ||
+		binary.LittleEndian.Uint32(prefix[start+52:start+56])&0xff000000 != 0xeb000000 {
+		return pkg.LinuxKernel{}, false, nil
+	}
+
+	extendedVersion, err := readLinuxKernelBanner(ctx, io.NewSectionReader(reader, int64(start+60), math.MaxInt64-int64(start+60)))
+	if err != nil {
+		return pkg.LinuxKernel{}, true, err
+	}
+	metadata := pkg.LinuxKernel{Architecture: "arm", Format: "Image", ExtendedVersion: extendedVersion}
+	if fields := strings.Fields(extendedVersion); len(fields) > 0 {
+		metadata.Version = fields[0]
+	}
+	return metadata, true, nil
 }
 
 func parseARM64LinuxKernel(ctx context.Context, reader io.ReaderAt) (pkg.LinuxKernel, bool, error) {

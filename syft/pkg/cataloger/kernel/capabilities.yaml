@@ -38,6 +38,7 @@ catalogers:
           - '**/Image'
           - '**/Image-*'
           - '**/Image.efi'
+          - '**/decompressed.bin'
           - '**/lib/modules/**/*.ko'
           - '**/lib/modules/**/*.ko.gz'
           - '**/lib/modules/**/*.ko.xz'

@@ -46,6 +46,7 @@ var kernelArchiveGlobs = []string{
 	"**/Image",
 	"**/Image-*",
 	"**/Image.efi",
+	"**/decompressed.bin",
 }
 
 var kernelModuleGlobs = []string{

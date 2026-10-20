@@ -2,6 +2,7 @@ package kernel
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,7 +18,7 @@ import (
 )
 
 func TestKernelCatalogerARM64Image(t *testing.T) {
-	for _, path := range []string{"Image.efi", "boot/Image.efi", "Image", "boot/Image-5.10.256"} {
+	for _, path := range []string{"Image.efi", "boot/Image.efi", "Image", "boot/Image-5.10.256", "decompressed.bin"} {
 		for _, sourceType := range []string{"directory", "file"} {
 			t.Run(sourceType+"/"+path, func(t *testing.T) {
 				directory := t.TempDir()
@@ -55,6 +56,89 @@ func TestKernelCatalogerARM64Image(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestKernelCatalogerARM32Image(t *testing.T) {
+	paths := []string{"vmlinux", "boot/vmlinux-5.10.240", "boot/Image", "decompressed.bin", "nested/extraction/decompressed.bin"}
+	for _, path := range paths {
+		for _, sourceType := range []string{"directory", "file"} {
+			t.Run(sourceType+"/"+path, func(t *testing.T) {
+				directory := t.TempDir()
+				imagePath := filepath.Join(directory, path)
+				require.NoError(t, os.MkdirAll(filepath.Dir(imagePath), 0755))
+				image := append(testARM32KernelEntry(t), []byte("Linux version "+testARM32KernelBanner+"\n\x00")...)
+				require.NoError(t, os.WriteFile(imagePath, image, 0600))
+				tester := pkgtest.NewCatalogTester()
+				if sourceType == "directory" {
+					tester.FromDirectory(t, directory)
+				} else {
+					tester.FromFileSource(t, imagePath)
+				}
+				tester.ExpectsAssertion(func(t *testing.T, packages []pkg.Package, relationships []artifact.Relationship) {
+					require.Empty(t, relationships)
+					require.Len(t, packages, 1)
+					kernelPackage := packages[0]
+					require.Equal(t, "linux-kernel", kernelPackage.Name)
+					require.Equal(t, "5.10.240", kernelPackage.Version)
+					require.Equal(t, "linux-kernel-cataloger", kernelPackage.FoundBy)
+					require.Equal(t, pkg.LinuxKernelPkg, kernelPackage.Type)
+					require.Equal(t, "pkg:generic/linux-kernel@5.10.240", kernelPackage.PURL)
+					require.Equal(t, []cpe.CPE{cpe.Must("cpe:2.3:o:linux:linux_kernel:5.10.240:*:*:*:*:*:*:*", cpe.NVDDictionaryLookupSource)}, kernelPackage.CPEs)
+					require.Equal(t, pkg.LinuxKernel{Architecture: "arm", Format: "Image", Version: "5.10.240", ExtendedVersion: testARM32KernelBanner}, kernelPackage.Metadata)
+					locations := kernelPackage.Locations.ToSlice()
+					require.Len(t, locations, 1)
+					expectedPath := path
+					if sourceType == "file" {
+						expectedPath = filepath.Base(path)
+					}
+					require.True(t, strings.HasSuffix(locations[0].RealPath, expectedPath))
+					require.Equal(t, pkg.PrimaryEvidenceAnnotation, locations[0].Annotations[pkg.EvidenceAnnotationKey])
+				}).TestCataloger(t, NewLinuxKernelCataloger(DefaultLinuxKernelCatalogerConfig()))
+			})
+		}
+	}
+}
+
+func TestKernelCatalogerARM32ImageRejectsUnrelatedAndBannerOnlyFiles(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path string
+		data []byte
+	}{
+		{name: "unrelated basename", path: "unrelated.bin", data: append(testARM32KernelEntry(t), []byte("Linux version "+testARM32KernelBanner+"\x00")...)},
+		{name: "banner only", path: "decompressed.bin", data: []byte("Linux version " + testARM32KernelBanner + "\x00")},
+		{name: "random data", path: "decompressed.bin", data: []byte("not a kernel")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(directory, test.path), test.data, 0600))
+			pkgtest.NewCatalogTester().FromDirectory(t, directory).
+				Expects(nil, nil).
+				TestCataloger(t, NewLinuxKernelCataloger(DefaultLinuxKernelCatalogerConfig()))
+		})
+	}
+}
+
+func TestKernelCatalogerX86ImageDecompressedBin(t *testing.T) {
+	image := make([]byte, 0x800)
+	binary.LittleEndian.PutUint16(image[510:512], 0xaa55)
+	copy(image[514:518], "HdrS")
+	binary.LittleEndian.PutUint16(image[518:520], 0x0206)
+	binary.LittleEndian.PutUint16(image[526:528], 0x0200)
+	image[529] = 1
+	copy(image[0x400:], "5.10.121-linuxkit (builder@host) #1 SMP")
+	directory := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(directory, "decompressed.bin"), image, 0600))
+	pkgtest.NewCatalogTester().FromDirectory(t, directory).
+		ExpectsAssertion(func(t *testing.T, packages []pkg.Package, relationships []artifact.Relationship) {
+			require.Empty(t, relationships)
+			require.Len(t, packages, 1)
+			metadata, ok := packages[0].Metadata.(pkg.LinuxKernel)
+			require.True(t, ok)
+			require.Equal(t, "x86", metadata.Architecture)
+			require.Equal(t, "bzImage", metadata.Format)
+			require.Equal(t, "5.10.121-linuxkit", metadata.Version)
+		}).TestCataloger(t, NewLinuxKernelCataloger(DefaultLinuxKernelCatalogerConfig()))
 }
 
 func TestKernelCatalogerARM64ImageRejectsNonKernel(t *testing.T) {
